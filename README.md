@@ -24,7 +24,7 @@ gcloud config list
 ## Local setup
 
 ### First create a working directory on your local system
-The following directory on the local system will contain: (a) a git repository for the WDL workflows, including the immuno worflow, (b) a git repository for tools that help provision and manage our workflow runs on the cloud.
+The following directory on the local system will contain the RNA results from the immuno pipeline that will enable you to run the fusion filtering script.
 
 ```bash
 mkdir -p $WORKING_BASE
