@@ -1,6 +1,6 @@
 # bsub -G compute-oncology -q oncology-interactive -Is -a 'docker_build(griffithlab/fusion_review)' -- --tag griffithlab/fusion_review .
 
-FROM python:3.8-slim-buster
+FROM python:3.11-slim-bookworm
 
 RUN ["apt-get", "update"]
 RUN ["apt-get", "install", "-y", "vim"]
