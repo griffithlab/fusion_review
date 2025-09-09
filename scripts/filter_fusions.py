@@ -26,7 +26,7 @@ def parse_arguments():
 
     parser.add_argument(
         "-WB",
-        help="the path to the gcp_immuno folder of the trial you wish to tun script on, defined as WORKING_BASE in envs.txt",
+        help="the path to the gcp_immuno folder of the trial you wish to run script on, defined as WORKING_BASE in envs.txt",
     )
 
     # The name of the final results folder
@@ -141,15 +141,208 @@ merged_filtered_df = pd.merge(
 # Step 1: Normalize your fusion name
 merged_filtered_df["FusionPartners"] = merged_filtered_df["#FusionName"].str.replace("--", "_", regex=False)
 
-# Step 2: Create a concatenated transcript field for matching
-merged_filtered_df["TranscriptKey"] = merged_filtered_df["CDS_LEFT_ID"].astype(str) + "_" + merged_filtered_df["CDS_RIGHT_ID"].astype(str)
+# # Step 2: Create a concatenated transcript field for matching
+# merged_filtered_df["TranscriptKey"] = merged_filtered_df["CDS_LEFT_ID"].astype(str) + "_" + merged_filtered_df["CDS_RIGHT_ID"].astype(str)
 
-merged_filtered_df["FusionCategory"] = merged_filtered_df["PROT_FUSION_TYPE"].map({
-    "FRAMESHIFT": "frameshift_fusion",
-    "INFRAME": "inframe_fusion"
-})
+# merged_filtered_df["FusionCategory"] = merged_filtered_df["PROT_FUSION_TYPE"].map({
+#     "FRAMESHIFT": "frameshift_fusion",
+#     "INFRAME": "inframe_fusion"
+# })
 
-merged_filtered_df["FusionKey"] = merged_filtered_df["FusionPartners"] + '.' + merged_filtered_df["TranscriptKey"] + '.' + merged_filtered_df["FusionCategory"]
+# merged_filtered_df["FusionKey"] = merged_filtered_df["FusionPartners"] + '.' + merged_filtered_df["TranscriptKey"] + '.' + merged_filtered_df["FusionCategory"]
+
+# ---------- AGFusion sequences + breakpoint cross-check ----------
+import os, zipfile, io, re
+
+BP_TOLERANCE = 25  # bp window to accept FI↔AGFusion breakpoint agreement
+
+# Parse numeric positions from FusionInspector breakpoints for cross-check
+merged_filtered_df["FI_LEFT_POS"]  = merged_filtered_df["LeftBreakpoint"].str.split(":").str[1].astype(int)
+merged_filtered_df["FI_RIGHT_POS"] = merged_filtered_df["RightBreakpoint"].str.split(":").str[1].astype(int)
+
+def _read_text_from_zip(zip_path, member):
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            if member in zf.namelist():
+                with zf.open(member) as fh:
+                    return io.TextIOWrapper(fh, encoding="utf-8").read()
+    except Exception:
+        pass
+    return None
+
+def _parse_fasta_seqs(text):
+    """Return list of sequences from FASTA text (no Biopython)."""
+    if not text:
+        return []
+    seqs, cur = [], []
+    for line in text.splitlines():
+        if line.startswith(">"):
+            if cur:
+                seqs.append("".join(cur))
+                cur = []
+        else:
+            cur.append(line.strip())
+    if cur:
+        seqs.append("".join(cur))
+    return seqs
+
+def _first_nonnull(df, cols_regex):
+    """Pick first existing column matching any regex; return first non-null value (as str)."""
+    for pat in cols_regex:
+        for c in df.columns:
+            if re.search(pat, c, flags=re.I):
+                col = df[c]
+                if col.notna().any():
+                    return str(col.dropna().iloc[0])
+                return None
+    return None
+
+def _collect_agfusion_view(ag_dir=None, ag_zip=None):
+    """
+    Build a small table with:
+      FusionPartners, AGFUS_LEFT_POS, AGFUS_RIGHT_POS,
+      AGFUS_INFRAME, AGFUS_CDS_SEQUENCE, AGFUS_TRANSL
+    by scanning either the unzipped agfusion_results/ or agfusion_results.zip.
+    """
+    rows = []
+
+    def handle_folder(folder_name, file_reader, names_lister, raw_reader=None):
+        # Expect folder like: HIC2-21442857_PI4KA-20734553
+        m = re.match(r"^([A-Za-z0-9]+)-(-?\d+)_([A-Za-z0-9]+)-(-?\d+)$", folder_name)
+        if not m:
+            return
+        lg, lp, rg, rp = m.groups()
+        base = f"{lg}_{rg}"
+
+        # Locate fusion_transcripts.csv
+        preferred = f"{folder_name}/{base}.fusion_transcripts.csv"
+        target = preferred if preferred in names_lister() else None
+        if not target:
+            # fallback: any CSV mentioning transcript/summary
+            for n in names_lister():
+                low = n.lower()
+                if n.startswith(folder_name + "/") and low.endswith(".csv") and ("transcript" in low or "summary" in low):
+                    target = n
+                    break
+
+        # Pull AGFUS_INFRAME from CSV (Fusion_effect or similar)
+        ag_inframe = None
+        if target:
+            try:
+                import pandas as _pd
+                df_csv = file_reader(target)
+                ag_inframe = _first_nonnull(df_csv, [r"fusion[_-]?effect", r"\bin[_-]?frame\b", r"\bframe\b", r"\borf"])
+            except Exception:
+                pass
+
+        # Get sequences from *_cds.fa and *_protein.fa
+        cds_member = f"{folder_name}/{base}_cds.fa"
+        prot_member = f"{folder_name}/{base}_protein.fa"
+
+        cds_text = raw_reader(cds_member) if raw_reader else None
+        prot_text = raw_reader(prot_member) if raw_reader else None
+
+        if ag_dir:
+            # unzipped dir path
+            cds_path  = os.path.join(ag_dir, cds_member)
+            prot_path = os.path.join(ag_dir, prot_member)
+            if os.path.exists(cds_path):
+                cds_text = open(cds_path, "r").read()
+            if os.path.exists(prot_path):
+                prot_text = open(prot_path, "r").read()
+
+        cds_seqs  = _parse_fasta_seqs(cds_text)
+        prot_seqs = _parse_fasta_seqs(prot_text)
+
+        rows.append({
+            "FusionPartners": base,
+            "AGFUS_LEFT_POS":  int(lp),
+            "AGFUS_RIGHT_POS": int(rp),
+            "AGFUS_INFRAME": ag_inframe,
+            "AGFUS_CDS_SEQUENCE":  ";".join(cds_seqs)  if cds_seqs  else None,
+            "AGFUS_TRANSL":        ";".join(prot_seqs) if prot_seqs else None,
+        })
+
+    if ag_dir and os.path.isdir(ag_dir):
+        # unzipped
+        def list_names():
+            out = []
+            for d in os.listdir(ag_dir):
+                p = os.path.join(ag_dir, d)
+                if os.path.isdir(p):
+                    for f in os.listdir(p):
+                        out.append(f"{d}/{f}")
+            return out
+        def file_reader(path_rel):
+            import pandas as _pd
+            return _pd.read_csv(os.path.join(ag_dir, path_rel))
+        for d in os.listdir(ag_dir):
+            if os.path.isdir(os.path.join(ag_dir, d)):
+                handle_folder(d, file_reader, list_names, raw_reader=None)
+    elif ag_zip and os.path.isfile(ag_zip):
+        # zip
+        with zipfile.ZipFile(ag_zip) as zf:
+            names = zf.namelist()
+            folders = sorted({n.split("/")[0] for n in names if "/" in n})
+            def list_names():
+                return names
+            def file_reader(path_rel):
+                import pandas as _pd
+                with zf.open(path_rel) as fh:
+                    return _pd.read_csv(io.TextIOWrapper(fh, encoding="utf-8"))
+            def raw_reader(member):
+                try:
+                    with zf.open(member) as fh:
+                        return io.TextIOWrapper(fh, encoding="utf-8").read()
+                except Exception:
+                    return None
+            for d in folders:
+                handle_folder(d, file_reader, list_names, raw_reader)
+    else:
+        return None
+
+    return pd.DataFrame(rows).drop_duplicates(subset=["FusionPartners"]) if rows else None
+
+ag_dir = args.WB + final_result + "/rnaseq/star_fusion/results/agfusion_results"
+ag_zip = args.WB + final_result + "/rnaseq/star_fusion/results/agfusion_results.zip"
+agfusion_view = _collect_agfusion_view(ag_dir=ag_dir if os.path.isdir(ag_dir) else None,
+                                       ag_zip=ag_zip if os.path.isfile(ag_zip) else None)
+
+if agfusion_view is not None:
+    merged_filtered_df = merged_filtered_df.merge(agfusion_view, on="FusionPartners", how="left")
+    # Breakpoint agreement check
+    merged_filtered_df["AGFUS_BP_MATCH"] = (
+        merged_filtered_df["AGFUS_LEFT_POS"].notna()
+        & merged_filtered_df["AGFUS_RIGHT_POS"].notna()
+        & ((merged_filtered_df["FI_LEFT_POS"]  - merged_filtered_df["AGFUS_LEFT_POS"]).abs()  <= BP_TOLERANCE)
+        & ((merged_filtered_df["FI_RIGHT_POS"] - merged_filtered_df["AGFUS_RIGHT_POS"]).abs() <= BP_TOLERANCE)
+    )
+
+# OPTIONAL: drop legacy AGFUS_* ID columns if they exist
+for col in ["AGFUS_LEFT_CDS","AGFUS_RIGHT_CDS","AGFUS_LEFT_TX","AGFUS_RIGHT_TX"]:
+    if col in merged_filtered_df.columns:
+        merged_filtered_df.drop(columns=[col], inplace=True)
+
+# Now (re)build keys AFTER enrichment
+star_cat = merged_filtered_df["PROT_FUSION_TYPE"].map({"FRAMESHIFT": "frameshift_fusion", "INFRAME": "inframe_fusion"})
+def _ag_to_cat(v):
+    if v is None: return None
+    s = str(v).lower()
+    if "in-frame" in s or s.strip() == "inframe": return "inframe_fusion"
+    if "out-of-frame" in s or "frameshift" in s:  return "frameshift_fusion"
+    return None
+ag_cat = merged_filtered_df.get("AGFUS_INFRAME", pd.Series([None]*len(merged_filtered_df))).map(_ag_to_cat)
+merged_filtered_df["FusionCategory"] = star_cat.fillna(ag_cat).fillna("no_cds_prediction")
+
+merged_filtered_df["TranscriptKey"] = (
+    merged_filtered_df["CDS_LEFT_ID"].fillna("NA").astype(str) + "_" + merged_filtered_df["CDS_RIGHT_ID"].fillna("NA").astype(str)
+)
+merged_filtered_df["FusionKey"] = (
+    merged_filtered_df["FusionPartners"] + "." + merged_filtered_df["TranscriptKey"] + "." + merged_filtered_df["FusionCategory"]
+)
+# ---------- end AGFusion sequences block ----------
+
+
 
 #read in pvacfuse classi file to merge
 pvacfuse_file_mhc_i = glob.glob(
@@ -172,8 +365,21 @@ merged_class_i_df = pd.merge(
     how="inner"  # or "inner" if you want only matches
 )
 
+cols_to_drop = [
+    "JunctionReads",
+    "SpanningFrags",
+    "CounterFusionLeftReads",
+    "CounterFusionRightReads",
+]
+
+for c in cols_to_drop:
+    if c in merged_class_i_df.columns:
+        merged_class_i_df.drop(columns=[c], inplace=True)
+
 merged_class_i_df.to_csv(
-    f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_i.review.csv", index=False
+    f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_i.review.tsv",
+    sep='\t',
+    index=False
 )
 
 #read in pvacfuse classii file to merge
@@ -198,46 +404,12 @@ merged_class_ii_df = pd.merge(
     how="inner"  # or "inner" if you want only matches
 )
 
+for c in cols_to_drop:
+    if c in merged_class_ii_df.columns:
+        merged_class_ii_df.drop(columns=[c], inplace=True)
+
 merged_class_ii_df.to_csv(
-    f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_ii.review.csv", index=False
+    f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_ii.review.tsv",
+    sep='\t',
+    index=False
 )
-
-# condition = (
-#     pvacfuse_df_mhc_i["Gene"].str.replace("_", "--").isin(passed_candidates)
-# ) & (pvacfuse_df_mhc_i["Num Passing Peptides"] > 0)
-# pvacfuse_df_mhc_i["Tier"] = pvacfuse_df_mhc_i["Tier"].astype("string")
-
-# # Set 'Status' column to 'Fusion Detected' where condition is True
-# pvacfuse_df_mhc_i.loc[condition, "Tier"] = "Review"
-
-# # Set 'Status' column to 'No Fusion' where condition is False
-# pvacfuse_df_mhc_i.loc[~condition, "Tier"] = "Poor"
-
-# pvacfuse_df_mhc_i.to_csv(
-#     f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_i.review.csv", index=False
-# )
-
-
-# # Filter the DataFrame for Class II
-# pvacfuse_file_mhc_ii = glob.glob(
-#     f"{args.WB}{final_result}/pVACfuse/mhc_ii/*.all_epitopes.aggregated.tsv"
-# )[0]
-# pvacfuse_df_mhc_ii = fusion_candidates_df = pd.read_csv(
-#     pvacfuse_file_mhc_ii,
-#     delimiter="\t",
-# )
-
-# condition = (
-#     pvacfuse_df_mhc_ii["Gene"].str.replace("_", "--").isin(passed_candidates)
-# ) & (pvacfuse_df_mhc_ii["Num Passing Peptides"] > 0)
-# pvacfuse_df_mhc_ii["Tier"] = pvacfuse_df_mhc_ii["Tier"].astype("string")
-
-# # Set 'Status' column to 'Fusion Detected' where condition is True
-# pvacfuse_df_mhc_ii.loc[condition, "Tier"] = "Review"
-
-# # Set 'Status' column to 'No Fusion' where condition is False
-# pvacfuse_df_mhc_ii.loc[~condition, "Tier"] = "Poor"
-
-# pvacfuse_df_mhc_ii.to_csv(
-#     f"{fusion_dir}/tumor-exome.all_epitopes.aggregated.mhc_ii.review.csv", index=False
-# )
