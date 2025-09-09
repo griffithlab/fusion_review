@@ -49,5 +49,8 @@ gsutil -m rsync -r -x '.*\.(bam|bai)$' gs://jlf-rcrf-immuno-outputs/JLF-100-038-
 ```
 
 ```bash
-python3 filter_fusions.py -WB  $WORKING_BASE -f final_results
+docker run -it --env WORKING_BASE -v $WORKING_BASE/:$WORKING_BASE/ -v /$HOME/.config/gcloud:/root/.config/gcloud kcotto/fusion_review /bin/bash
+
+cd $WORKING_BASE
+python3 /opt/scripts/filter_fusions.py -WB  $WORKING_BASE -f final_results
 ```
